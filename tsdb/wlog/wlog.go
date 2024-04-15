@@ -35,6 +35,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/prometheus/prometheus/tsdb/fileutil"
+	// TODO: just for the PoC
+	client_testutil "github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 const (
@@ -258,6 +260,7 @@ func newWLMetrics(w *WL, r prometheus.Registerer) *wlMetrics {
 		Name: "segment_current",
 		Help: "Write log segment index that TSDB is currently writing to.",
 	})
+	// TODO: here
 	m.writesFailed = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "writes_failed_total",
 		Help: "Total number of write log writes that failed.",
@@ -376,6 +379,11 @@ func Open(logger log.Logger, dir string) (*WL, error) {
 	}
 
 	return w, nil
+}
+
+// TODO: this is just a PoC
+func (w *WL) WritesFailedCount() float64 {
+	return client_testutil.ToFloat64(w.metrics.writesFailed)
 }
 
 // CompressionType returns if compression is enabled on this WAL.
@@ -672,10 +680,15 @@ func (w *WL) pagesPerSegment() int {
 func (w *WL) Log(recs ...[]byte) error {
 	w.mtx.Lock()
 	defer w.mtx.Unlock()
+
+	// TODO: just for tests
+	w.metrics.writesFailed.Inc()
+
 	// Callers could just implement their own list record format but adding
 	// a bit of extra logic here frees them from that overhead.
 	for i, r := range recs {
 		if err := w.log(r, i == len(recs)-1); err != nil {
+			// TODO
 			w.metrics.writesFailed.Inc()
 			return err
 		}

@@ -1619,6 +1619,7 @@ loop:
 			err = storage.ErrDuplicateSampleForTimestamp
 		} else {
 			if ctMs := p.CreatedTimestamp(); sl.enableCTZeroIngestion && ctMs != nil {
+				fmt.Println(ctMs)
 				ref, err = app.AppendCTZeroSample(ref, lset, t, *ctMs)
 				if err != nil && !errors.Is(err, storage.ErrOutOfOrderCT) { // OOO is a common case, ignoring completely for now.
 					// CT is an experimental feature. For now, we don't need to fail the

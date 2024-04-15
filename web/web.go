@@ -179,6 +179,7 @@ type PrometheusVersion = api_v1.PrometheusVersion
 type LocalStorage interface {
 	storage.Storage
 	api_v1.TSDBAdminStats
+	Healthy() error
 }
 
 // Handler serves various HTTP endpoints of the Prometheus server.
@@ -476,10 +477,7 @@ func New(logger log.Logger, o *Options) *Handler {
 	router.Get("/debug/*subpath", serveDebug)
 	router.Post("/debug/*subpath", serveDebug)
 
-	router.Get("/-/healthy", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		fmt.Fprintf(w, o.AppName+" is Healthy.\n")
-	})
+	router.Get("/-/healthy", h.healthy)
 	router.Head("/-/healthy", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})
@@ -539,6 +537,22 @@ func (h *Handler) SetReady(v bool) {
 // Verifies whether the server is ready or not.
 func (h *Handler) isReady() bool {
 	return h.ready.Load() > 0
+}
+
+// Verifies whether the server is healthy or not.
+func (h *Handler) healthy(w http.ResponseWriter, req *http.Request) {
+/* 	if h.localStorage == nil {
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, "XXX is healthy.\n")
+		return
+	} */
+	if err := h.localStorage.Healthy(); err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		fmt.Fprintf(w, "XXXX is not healthy: %v.\n", err)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintf(w, "XXX is healthy.\n")
 }
 
 // Checks if server is ready, calls f if it is, returns 503 if it is not.

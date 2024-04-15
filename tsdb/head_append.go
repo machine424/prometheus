@@ -744,6 +744,7 @@ func (a *headAppender) log() error {
 		buf = rec[:0]
 
 		if err := a.head.wal.Log(rec); err != nil {
+			// TODO: here
 			return fmt.Errorf("log samples: %w", err)
 		}
 	}

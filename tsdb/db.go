@@ -239,6 +239,8 @@ type DB struct {
 	writeNotified wlog.WriteNotified
 
 	registerer prometheus.Registerer
+
+	lastWALWritesFailedCount float64
 }
 
 type dbMetrics struct {
@@ -961,6 +963,17 @@ func removeBestEffortTmpDirs(l log.Logger, dir string) error {
 		}
 	}
 	return nil
+}
+
+func (db *DB) Healthy() (err error) {
+	// TODO: healthchecks should ideally happen every t > min(scrape_interval)
+	// 
+	c := db.head.wal.WritesFailedCount()
+	if c > db.lastWALWritesFailedCount {
+		err = fmt.Errorf("WALWritesFailedCount increased %f -> %f", db.lastWALWritesFailedCount, c)
+	}
+	db.lastWALWritesFailedCount = c
+	return
 }
 
 // StartTime implements the Storage interface.

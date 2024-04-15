@@ -120,6 +120,7 @@ func main() {
 		"The config files to check.",
 	).Required().ExistingFiles()
 
+	// TODO: take into account
 	checkServerHealthCmd := checkCmd.Command("healthy", "Check if the Prometheus server is healthy.")
 	checkServerHealthCmd.Flag("http.config.file", "HTTP client configuration file for promtool to connect to Prometheus.").PlaceHolder("<filename>").ExistingFileVar(&httpConfigFilePath)
 	checkServerHealthCmd.Flag("url", "The URL for the Prometheus server.").Default("http://localhost:9090").URLVar(&serverURL)

@@ -1460,6 +1460,20 @@ func (s *readyStorage) getStats() *tsdb.DBStats {
 	return x
 }
 
+func (s *readyStorage) Healthy() error {
+	if x := s.get(); x != nil {
+		switch db := x.(type) {
+		case *tsdb.DB:
+			return db.Healthy()
+		case *agent.DB:
+			return fmt.Errorf("TODO")
+		default:
+			panic(fmt.Sprintf("unknown storage type %T", db))
+		}
+	}
+	return nil
+}
+
 // StartTime implements the Storage interface.
 func (s *readyStorage) StartTime() (int64, error) {
 	if x := s.get(); x != nil {
