@@ -2136,3 +2136,21 @@ func optsFactory(storage storage.Storage, maxInflight, inflightQueries *atomic.I
 		},
 	}
 }
+
+// TestUpdateWhenStopped reproduces https://github.com/prometheus/prometheus/issues/14146
+func TestUpdateWhenStopped(t *testing.T) {
+	files := []string{"fixtures/rules.yaml"}
+	ruleManager := NewManager(&ManagerOptions{
+		Context: context.Background(),
+		Logger:  log.NewNopLogger(),
+	})
+	ruleManager.start()
+	err := ruleManager.Update(10*time.Second, files, labels.EmptyLabels(), "", nil)
+	require.NoError(t, err)
+	require.NotEmpty(t, ruleManager.groups)
+
+	// Because updating and stopping the manager are handled in different places,
+	// if the manager is stopped first, updating should not fail.
+	ruleManager.Stop()
+	err = ruleManager.Update(10*time.Second, []string{}, labels.EmptyLabels(), "", nil)
+}
