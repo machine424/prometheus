@@ -740,9 +740,6 @@ func TestRun_AvoidNotifyWhenBehind(t *testing.T) {
 	const seriesCount = 10
 	const samplesCount = 50
 
-	// This test can take longer than intended to finish in cloud CI.
-	readTimeout := 10 * time.Second
-
 	for _, compress := range []CompressionType{CompressionNone, CompressionSnappy, CompressionZstd} {
 		t.Run(string(compress), func(t *testing.T) {
 			dir := t.TempDir()
@@ -753,36 +750,45 @@ func TestRun_AvoidNotifyWhenBehind(t *testing.T) {
 
 			w, err := NewSize(nil, nil, wdir, segmentSize, compress)
 			require.NoError(t, err)
-			var wg sync.WaitGroup
 			// Generate one segment initially to ensure that watcher.Run() finds at least one segment on disk.
 			require.NoError(t, generateWALRecords(w, 0, seriesCount, samplesCount))
 			w.NextSegment() // Force creation of the next segment
+
+			// Set up the watcher and run it in the background.
+			wt := newWriteToMock(time.Millisecond)
+			watcher := NewWatcher(wMetrics, nil, nil, "", wt, dir, false, false)
+			watcher.setMetrics()
+			watcher.MaxSegment = segmentsToRead
+
+			// Run the watcher in the background.
+			var wg sync.WaitGroup
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				for i := 1; i < segmentsToWrite; i++ {
-					require.NoError(t, generateWALRecords(w, i, seriesCount, samplesCount))
-					w.NextSegment()
-				}
+				startTime := time.Now()
+				err = watcher.Run()
+				require.NoError(t, err)
+				// If the watcher was to wait for readTicker to read every new segment, it would need readTimeout * segmentsToRead.
+				// This test can take longer than intended to finish in cloud CI.
+				require.Less(t, time.Since(startTime), readTimeout, "Watcher shouldn't rely on readTicker or readNotify to read the new segments.")
 			}()
 
-			wt := newWriteToMock(time.Millisecond)
-			watcher := NewWatcher(wMetrics, nil, nil, "", wt, dir, false, false)
-			watcher.MaxSegment = segmentsToRead
-
-			watcher.setMetrics()
-			startTime := time.Now()
-			err = watcher.Run()
-			wg.Wait()
-			require.Less(t, time.Since(startTime), readTimeout)
-
-			// But samples records shouldn't get dropped
+			// The watcher went through the first segment and is tailling the second one.
 			retry(t, defaultRetryInterval, defaultRetries, func() bool {
-				return wt.checkNumSeries() > 0
+				return wt.checkNumSeries() == seriesCount
 			})
-			require.Equal(t, segmentsToRead*seriesCount*samplesCount, wt.samplesAppended)
 
-			require.NoError(t, err)
+			// In the meantime, add some new segments.
+			for i := 1; i < segmentsToWrite; i++ {
+				require.NoError(t, generateWALRecords(w, i, seriesCount, samplesCount))
+				w.NextSegment()
+			}
+
+			// Wait for the watcher.
+			wg.Wait()
+
+			// All samples were read.
+			require.Equal(t, segmentsToRead*seriesCount*samplesCount, wt.samplesAppended)
 			require.NoError(t, w.Close())
 		})
 	}
