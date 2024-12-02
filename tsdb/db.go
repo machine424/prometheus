@@ -1574,10 +1574,12 @@ func (db *DB) reloadBlocks() (err error) {
 	db.mtx.Lock()
 	defer db.mtx.Unlock()
 
+	start := time.Now()
 	loadable, corrupted, err := openBlocks(db.logger, db.dir, db.blocks, db.chunkPool, db.opts.PostingsDecoderFactory)
 	if err != nil {
 		return err
 	}
+	db.logger.Info("xxx openBlocks in reloadBlocks", "len(loadable)", len(loadable), "len(corrupted)", len(corrupted), "duration", time.Since(start))
 
 	deletableULIDs := db.blocksToDelete(loadable)
 	deletable := make(map[ulid.ULID]*Block, len(deletableULIDs))
@@ -1677,20 +1679,24 @@ func openBlocks(l *slog.Logger, dir string, loaded []*Block, chunkPool chunkenc.
 
 	corrupted = make(map[ulid.ULID]error)
 	for _, bDir := range bDirs {
+		start := time.Now()
 		meta, _, err := readMetaFile(bDir)
 		if err != nil {
 			l.Error("Failed to read meta.json for a block during reloadBlocks. Skipping", "dir", bDir, "err", err)
 			continue
 		}
+		l.Info("xxx readMetaFile in openBlocks", "bDir", bDir, "duration", time.Since(start))
 
 		// See if we already have the block in memory or open it otherwise.
 		block, open := getBlock(loaded, meta.ULID)
 		if !open {
+			start = time.Now()
 			block, err = OpenBlock(l, bDir, chunkPool, postingsDecoderFactory)
 			if err != nil {
 				corrupted[meta.ULID] = err
 				continue
 			}
+			l.Info("xxx OpenBlock in openBlocks", "bDir", bDir, "ulid", meta.ULID, "duration", time.Since(start))
 		}
 		blocks = append(blocks, block)
 	}

@@ -25,6 +25,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sync"
+	"time"
 
 	"github.com/oklog/ulid"
 
@@ -344,32 +345,40 @@ func OpenBlock(logger *slog.Logger, dir string, pool chunkenc.Pool, postingsDeco
 			err = tsdb_errors.NewMulti(err, tsdb_errors.CloseAll(closers)).Err()
 		}
 	}()
+	start := time.Now()
 	meta, sizeMeta, err := readMetaFile(dir)
 	if err != nil {
 		return nil, err
 	}
+	logger.Info("xxx readMetaFile in OpenBlock", "dir", dir, "duration", time.Since(start))
 
+	start = time.Now()
 	cr, err := chunks.NewDirReader(chunkDir(dir), pool)
 	if err != nil {
 		return nil, err
 	}
 	closers = append(closers, cr)
+	logger.Info("xxx chunks.NewDirReader in OpenBlock", "chunkDir", chunkDir(dir), "duration", time.Since(start))
 
 	decoder := index.DecodePostingsRaw
 	if postingsDecoderFactory != nil {
 		decoder = postingsDecoderFactory(meta)
 	}
+	start = time.Now()
 	ir, err := index.NewFileReader(filepath.Join(dir, indexFilename), decoder)
 	if err != nil {
 		return nil, err
 	}
 	closers = append(closers, ir)
+	logger.Info("xxx index.NewFileReader in OpenBlock", "index", filepath.Join(dir, indexFilename), "duration", time.Since(start))
 
+	start = time.Now()
 	tr, sizeTomb, err := tombstones.ReadTombstones(dir)
 	if err != nil {
 		return nil, err
 	}
 	closers = append(closers, tr)
+	logger.Info("xxx tombstones.ReadTombstones in OpenBlock", "dir", dir, "duration", time.Since(start))
 
 	pb = &Block{
 		dir:               dir,
