@@ -16,6 +16,7 @@ package parser
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"os"
 	"runtime"
@@ -24,14 +25,110 @@ import (
 	"sync"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/model"
+	"github.com/prometheus/common/promslog"
 
 	"github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/model/timestamp"
 	"github.com/prometheus/prometheus/promql/parser/posrange"
+	"github.com/prometheus/prometheus/util/logging"
 	"github.com/prometheus/prometheus/util/strutil"
 )
+
+var (
+	logger                   = setLogger()
+	narrowSelectorOnIntegers = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "prometheus_parser_narrow_selector_on_integers",
+			Help: "Number of matchers that are explicitly set to only match integers on 'quantile' and 'le' labels",
+		},
+	)
+)
+
+func init() {
+	prometheus.MustRegister(narrowSelectorOnIntegers)
+}
+
+// setLogger doesn't take global logging config into account.
+// This is a temporary measure.
+func setLogger() *slog.Logger {
+	logger := promslog.New(&promslog.Config{})
+	deduper := logging.Dedupe(logger, 10*time.Second)
+	return slog.New(deduper)
+}
+
+// isInteger is a light strconv.Atoi that avoids allocations due to Atoi's returned error and doesn't
+// consider as integers invalid, big, or underscored integers.
+func isInteger(s string) (int, bool) {
+	sLen := len(s)
+	if strconv.IntSize == 32 && (0 < sLen && sLen < 10) ||
+		strconv.IntSize == 64 && (0 < sLen && sLen < 19) {
+		// Fast path for small integers that fit int type.
+		s0 := s
+		if s[0] == '-' || s[0] == '+' {
+			s = s[1:]
+			if len(s) < 1 {
+				return 0, false
+			}
+		}
+
+		n := 0
+		for _, ch := range []byte(s) {
+			ch -= '0'
+			if ch > 9 {
+				return 0, false
+			}
+			n = n*10 + int(ch)
+		}
+		if s0[0] == '-' {
+			n = -n
+		}
+		return n, true
+	}
+
+	// Slow path for invalid, big, or underscored integers.
+	i64, err := strconv.ParseInt(s, 10, 0)
+	return int(i64), err == nil
+}
+
+// checkLabelMatchers helps to detect unintentional misuses of matchers on "quantile" and "le" labels after normalization during scraping
+// introduced in Prometheus3. For more details, see https://prometheus.io/docs/prometheus/latest/migration/#le-and-quantile-label-values.
+// It specifically detects integers-only label matchers formatted as "integer" and "integer|integer|integer" (as they're the most likely to contain them).
+// Refer to Test_checkLabelMatchers for more details.
+func checkLabelMatchers(vs *VectorSelector) {
+Outer:
+	for _, lm := range vs.LabelMatchers {
+		if lm == nil {
+			continue
+		}
+		if lm.Name == model.QuantileLabel || (strings.HasSuffix(vs.Name, "_bucket") && lm.Name == model.BucketLabel) {
+			switch lm.Type {
+			case labels.MatchEqual, labels.MatchNotEqual:
+				if n, ok := isInteger(lm.Value); ok {
+					narrowSelectorOnIntegers.Inc()
+					logger.Warn("selector set to explicitly match an integer, but values could be floats", "narrow_matcher_label", lm.Name, "integer", n, "matchers", vs.LabelMatchers)
+				}
+				break Outer
+			case labels.MatchRegexp, labels.MatchNotRegexp:
+				if len(lm.Value) == 0 {
+					break Outer
+				}
+				vals := strings.Split(lm.Value, "|")
+				for _, val := range vals {
+					if _, ok := isInteger(val); !ok {
+						break Outer
+					}
+				}
+
+				narrowSelectorOnIntegers.Inc()
+				logger.Warn("selector set to explicitly match integers only, but values could be floats", "narrow_matcher_label", lm.Name, "matchers", vs.LabelMatchers)
+				break Outer
+			}
+		}
+	}
+}
 
 var parserPool = sync.Pool{
 	New: func() interface{} {
@@ -893,6 +990,11 @@ func (p *parser) parseGenerated(startSymbol ItemType) interface{} {
 	p.InjectItem(startSymbol)
 
 	p.yyParser.Parse(p)
+
+	vs, ok := p.generatedParserResult.(*VectorSelector)
+	if ok {
+		checkLabelMatchers(vs)
+	}
 
 	return p.generatedParserResult
 }
