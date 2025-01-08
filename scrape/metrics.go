@@ -37,6 +37,7 @@ type scrapeMetrics struct {
 	targetScrapePoolSymbolTableItems    *prometheus.GaugeVec
 	targetSyncIntervalLength            *prometheus.SummaryVec
 	targetSyncFailed                    *prometheus.CounterVec
+	targetInvalidContentType            prometheus.Counter
 
 	// Used by targetScraper.
 	targetScrapeExceededBodySizeLimit prometheus.Counter
@@ -159,6 +160,12 @@ func newScrapeMetrics(reg prometheus.Registerer) (*scrapeMetrics, error) {
 		},
 		[]string{"scrape_job"},
 	)
+	sm.targetInvalidContentType = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "prometheus_target_scrape_pool_invalid_content_type_total",
+			Help: "Total number of times scrape pools could not determine the valid content type of a scrape target.",
+		},
+	)
 
 	// Used by targetScraper.
 	sm.targetScrapeExceededBodySizeLimit = prometheus.NewCounter(
@@ -244,6 +251,7 @@ func newScrapeMetrics(reg prometheus.Registerer) (*scrapeMetrics, error) {
 		sm.targetScrapePoolTargetsAdded,
 		sm.targetScrapePoolSymbolTableItems,
 		sm.targetSyncFailed,
+		sm.targetInvalidContentType,
 		// Used by targetScraper.
 		sm.targetScrapeExceededBodySizeLimit,
 		// Used by scrapeCache.
@@ -285,6 +293,7 @@ func (sm *scrapeMetrics) Unregister() {
 	sm.reg.Unregister(sm.targetScrapePoolTargetsAdded)
 	sm.reg.Unregister(sm.targetScrapePoolSymbolTableItems)
 	sm.reg.Unregister(sm.targetSyncFailed)
+	sm.reg.Unregister(sm.targetInvalidContentType)
 	sm.reg.Unregister(sm.targetScrapeExceededBodySizeLimit)
 	sm.reg.Unregister(sm.targetScrapeCacheFlushForced)
 	sm.reg.Unregister(sm.targetIntervalLength)

@@ -1582,6 +1582,7 @@ func (sl *scrapeLoop) append(app storage.Appender, b []byte, contentType string,
 
 	p, err := textparse.New(b, contentType, sl.fallbackScrapeProtocol, sl.alwaysScrapeClassicHist, sl.enableCTZeroIngestion, sl.symbolTable)
 	if p == nil {
+		sl.metrics.targetInvalidContentType.Inc()
 		sl.l.Error(
 			"Failed to determine correct type of scrape target.",
 			"content_type", contentType,
