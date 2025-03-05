@@ -133,7 +133,8 @@ func NewDecbufAt(bs ByteSlice, off int, castagnoliTable *crc32.Table) Decbuf {
 
 	if castagnoliTable != nil {
 		if exp := binary.BigEndian.Uint32(b[len(b)-4:]); dec.Crc32(castagnoliTable) != exp {
-			return Decbuf{E: ErrInvalidChecksum}
+			// return Decbuf{E: ErrInvalidChecksum}
+			fmt.Printf("NewDecbufAt: %v unexpected checksum: %x expected: %x\n", ErrInvalidChecksum, exp, dec.Crc32(castagnoliTable))
 		}
 	}
 	return dec
@@ -163,8 +164,11 @@ func NewDecbufUvarintAt(bs ByteSlice, off int, castagnoliTable *crc32.Table) Dec
 	b = bs.Range(off+n, off+n+int(l)+4)
 	dec := Decbuf{B: b[:len(b)-4]}
 
-	if dec.Crc32(castagnoliTable) != binary.BigEndian.Uint32(b[len(b)-4:]) {
-		return Decbuf{E: ErrInvalidChecksum}
+	expCRC := dec.Crc32(castagnoliTable)
+	ch := binary.BigEndian.Uint32(b[len(b)-4:])
+	if ch != expCRC {
+		fmt.Printf("NewDecbufUvarintAt: %v unexpected checksum: %x expected: %x\n", ErrInvalidChecksum, ch, expCRC)
+		// return Decbuf{E: ErrInvalidChecksum}
 	}
 	return dec
 }

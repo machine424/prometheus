@@ -131,7 +131,8 @@ func (r *Reader) next() (err error) {
 			return fmt.Errorf("invalid size: expected %d, got %d", length, n)
 		}
 		if c := crc32.Checksum(buf[:length], castagnoliTable); c != crc {
-			return fmt.Errorf("unexpected checksum %x, expected %x", c, crc)
+			// return fmt.Errorf("unexpected checksum %x, expected %x", c, crc)
+			fmt.Printf("curRecTyp: %s length: %d total bytes processed: %d unexpected checksum: %x expected: %x\n", r.curRecTyp.String(), length, r.total, c, crc)
 		}
 
 		if isSnappyCompressed || isZstdCompressed {

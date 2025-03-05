@@ -861,7 +861,7 @@ func open(dir string, l *slog.Logger, r prometheus.Registerer, opts *Options, rn
 		compactc:       make(chan struct{}, 1),
 		donec:          make(chan struct{}),
 		stopc:          make(chan struct{}),
-		autoCompact:    true,
+		autoCompact:    false,
 		chunkPool:      chunkenc.NewPool(),
 		blocksToDelete: opts.BlocksToDelete,
 		registerer:     r,
