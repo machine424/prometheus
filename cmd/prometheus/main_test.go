@@ -38,6 +38,7 @@ import (
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/common/promslog"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/atomic"
 
 	"github.com/prometheus/prometheus/config"
 	"github.com/prometheus/prometheus/model/labels"
@@ -756,6 +757,7 @@ global:
 			os.WriteFile(configFile, []byte(tc.config), 0o777)
 			prom := prometheusCommandWithLogging(
 				t,
+				nil,
 				configFile,
 				port,
 				fmt.Sprintf("--storage.tsdb.path=%s", tmpDir),
@@ -838,6 +840,7 @@ scrape_configs:
 
 			prom := prometheusCommandWithLogging(
 				t,
+				nil,
 				configFile,
 				port,
 				fmt.Sprintf("--storage.tsdb.path=%s", tmpDir),
@@ -881,4 +884,61 @@ scrape_configs:
 			}, 15*time.Second, 500*time.Millisecond)
 		})
 	}
+}
+
+// TestWarnDuplicateTargetsFeatureFlag tests that the warn-duplicate-targets feature flag
+// produces warning logs when duplicate targets are found after relabelling.
+func TestWarnDuplicateTargetsFeatureFlag(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping test in short mode.")
+	}
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+	configFile := filepath.Join(tmpDir, "prometheus.yml")
+
+	// Create a configuration that will result in duplicate targets after relabelling
+	config := `
+scrape_configs:
+  - job_name: "jobOne"
+    static_configs:
+      - targets: [localhost:9000]
+        labels: {foo: bar, aa: bb}
+    relabel_configs:
+      - action: labeldrop
+        regex: "job|foo"
+  - job_name: "jobTwo"
+    static_configs:
+      - targets: [localhost:9000]
+        labels: {foo: baz, aa: bb}
+    relabel_configs:
+      - action: labeldrop
+        regex: "job|foo"
+`
+	require.NoError(t, os.WriteFile(configFile, []byte(config), 0o644))
+	port := testutil.RandomUnprivilegedPort(t)
+
+	var warningFound atomic.Bool
+	captureLogLine := func(line string) {
+		t.Log(line)
+		if warningFound.Load() {
+			return
+		}
+		if strings.Contains(line, `msg="Found active targets with same labels after relabelling" component="scrape manager" labels="{__address__=\"localhost:9000\", __metrics_path__=\"/metrics\", __scheme__=\"http\", __scrape_interval__=\"1m\", __scrape_timeout__=\"10s\", aa=\"bb\", instance=\"localhost:9000\"}"`) {
+			warningFound.Store(true)
+		}
+	}
+
+	prom := prometheusCommandWithLogging(
+		t,
+		captureLogLine,
+		configFile,
+		port,
+		fmt.Sprintf("--storage.tsdb.path=%s", tmpDir),
+		"--enable-feature=warn-duplicate-targets",
+	)
+	require.NoError(t, prom.Start())
+
+	// Wait for the warning message to appear
+	require.Eventually(t, warningFound.Load, 10*time.Second, 100*time.Millisecond)
 }

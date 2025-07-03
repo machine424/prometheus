@@ -119,7 +119,7 @@ func runTestSteps(t *testing.T, steps []struct {
 	require.NoError(t, os.WriteFile(configFilePath, []byte(steps[0].configText), 0o644), "Failed to write initial config file")
 
 	port := testutil.RandomUnprivilegedPort(t)
-	prom := prometheusCommandWithLogging(t, configFilePath, port, "--enable-feature=auto-reload-config", "--config.auto-reload-interval=1s")
+	prom := prometheusCommandWithLogging(t, nil, configFilePath, port, "--enable-feature=auto-reload-config", "--config.auto-reload-interval=1s")
 	require.NoError(t, prom.Start())
 
 	baseURL := "http://localhost:" + strconv.Itoa(port)
@@ -188,17 +188,17 @@ func verifyConfigReloadMetric(t *testing.T, baseURL string, expectedValue float6
 	return found && actualValue == expectedValue
 }
 
-func captureLogsToTLog(t *testing.T, r io.Reader) {
+func captureLogLine(t *testing.T, r io.Reader, onLogLine func(string)) {
 	scanner := bufio.NewScanner(r)
 	for scanner.Scan() {
-		t.Log(scanner.Text())
+		onLogLine(scanner.Text())
 	}
 	if err := scanner.Err(); err != nil {
 		t.Logf("Error reading logs: %v", err)
 	}
 }
 
-func prometheusCommandWithLogging(t *testing.T, configFilePath string, port int, extraArgs ...string) *exec.Cmd {
+func prometheusCommandWithLogging(t *testing.T, onLogLine func(string), configFilePath string, port int, extraArgs ...string) *exec.Cmd {
 	stdoutPipe, stdoutWriter := io.Pipe()
 	stderrPipe, stderrWriter := io.Pipe()
 
@@ -215,13 +215,19 @@ func prometheusCommandWithLogging(t *testing.T, configFilePath string, port int,
 	prom.Stdout = stdoutWriter
 	prom.Stderr = stderrWriter
 
+	if onLogLine == nil {
+		onLogLine = func(l string) {
+			t.Log(l)
+		}
+	}
+
 	go func() {
 		defer wg.Done()
-		captureLogsToTLog(t, stdoutPipe)
+		captureLogLine(t, stdoutPipe, onLogLine)
 	}()
 	go func() {
 		defer wg.Done()
-		captureLogsToTLog(t, stderrPipe)
+		captureLogLine(t, stderrPipe, onLogLine)
 	}()
 
 	t.Cleanup(func() {
