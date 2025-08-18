@@ -20,7 +20,6 @@ import (
 	"net/http"
 	"net/url"
 	"sync"
-	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/model"
@@ -163,9 +162,19 @@ func (n *Manager) ApplyConfig(conf *config.Config) error {
 		if oldAmSet, ok := configToAlertmanagers[hash]; ok {
 			ams.ams = oldAmSet.ams
 			ams.droppedAms = oldAmSet.droppedAms
+			ams.sendLoops = oldAmSet.sendLoops
 		}
 
 		amSets[k] = ams
+	}
+
+	// TODO(queueperam): add comment and test; especially for queue draining
+	for k, oldAmSet := range n.alertmanagers {
+		if _, exists := amSets[k]; !exists {
+			oldAmSet.mtx.Lock()
+			oldAmSet.cleanSendLoops(oldAmSet.ams)
+			oldAmSet.mtx.Unlock()
+		}
 	}
 
 	n.alertmanagers = amSets
@@ -180,8 +189,14 @@ func (n *Manager) ApplyConfig(conf *config.Config) error {
 // Refer to https://github.com/prometheus/prometheus/issues/13676 for more details.
 func (n *Manager) Run(tsets <-chan map[string][]*targetgroup.Group) {
 	n.targetUpdateLoop(tsets)
-	<-n.stopRequested
-	n.drainQueue()
+
+	n.mtx.Lock()
+	defer n.mtx.Unlock()
+	for _, ams := range n.alertmanagers {
+		ams.mtx.Lock()
+		ams.cleanSendLoops(ams.ams)
+		ams.mtx.Unlock()
+	}
 }
 
 // targetUpdateLoop receives updates of target groups and triggers a reload.
@@ -205,42 +220,6 @@ func (n *Manager) targetUpdateLoop(tsets <-chan map[string][]*targetgroup.Group)
 	}
 }
 
-func (n *Manager) drainQueue() {
-	if !n.opts.DrainOnShutdown {
-		for _, ams := range n.alertmanagers {
-			for am, b := range ams.buffers {
-				n.logger.Warn("Draining remaining notifications on shutdown is disabled, and some notifications have been dropped", "alertmanager", am, "count", b.len())
-				n.metrics.dropped.WithLabelValues(am).Add(float64(b.len()))
-				b.close()
-			}
-		}
-		return
-	}
-
-	n.logger.Info("Draining any remaining notifications...")
-
-	drained := false
-	for !drained {
-		remain := false
-		for _, ams := range n.alertmanagers {
-			for am, b := range ams.buffers {
-				if b.len() > 0 {
-					remain = true
-					n.logger.Info("Remaining notifications to drain", "alertmanager", am, "count", b.len())
-				}
-			}
-		}
-		drained = !remain
-		time.Sleep(100 * time.Millisecond)
-	}
-	n.logger.Info("Remaining notifications drained, stopping send loops")
-	for _, ams := range n.alertmanagers {
-		for _, b := range ams.buffers {
-			b.close()
-		}
-	}
-}
-
 func (n *Manager) reload(tgs map[string][]*targetgroup.Group) {
 	n.mtx.Lock()
 	defer n.mtx.Unlock()
@@ -258,6 +237,13 @@ func (n *Manager) reload(tgs map[string][]*targetgroup.Group) {
 // Send queues the given notification requests for processing.
 // Panics if called on a handler that is not running.
 func (n *Manager) Send(alerts ...*Alert) {
+	// If we've been asked to stop, that takes priority over accepting new alerts.
+	select {
+	case <-n.stopRequested:
+		return
+	default:
+	}
+
 	n.mtx.RLock()
 	defer n.mtx.RUnlock()
 
@@ -267,14 +253,7 @@ func (n *Manager) Send(alerts ...*Alert) {
 	}
 
 	for _, ams := range n.alertmanagers {
-		dropped := ams.send(alerts...)
-		for am, count := range dropped {
-			n.logger.Warn("Notification queue is full, and some old notifications have been dropped", "alertmanager", am, "count", count)
-			n.metrics.dropped.WithLabelValues(am).Add(float64(count))
-		}
-		for am, q := range ams.buffers {
-			n.metrics.queueLength.WithLabelValues(am).Set(float64(q.len()))
-		}
+		ams.send(alerts...)
 	}
 }
 
@@ -320,7 +299,7 @@ func (n *Manager) DroppedAlertmanagers() []*url.URL {
 //
 // Run will return once the notification manager has successfully shut down.
 //
-// The manager will optionally drain any queued notifications before shutting down.
+// The manager will optionally drain send loops before shutting down.
 //
 // Stop is safe to call multiple times.
 func (n *Manager) Stop() {

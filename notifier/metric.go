@@ -64,6 +64,7 @@ func newAlertMetrics(r prometheus.Registerer, alertmanagersDiscovered func() flo
 			Name:      "queue_length",
 			Help:      "The number of alert notifications in the queue.",
 		}, []string{alertmanagerLabel}),
+		// TODO(queueperam): why alertmanagerLabel??
 		queueCapacity: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Namespace: namespace,
 			Subsystem: subsystem,

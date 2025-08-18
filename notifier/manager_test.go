@@ -27,7 +27,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
-	dto "github.com/prometheus/client_model/go"
+	prom_testutil "github.com/prometheus/client_golang/prometheus/testutil"
 	config_util "github.com/prometheus/common/config"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/common/promslog"
@@ -42,46 +42,6 @@ import (
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/model/relabel"
 )
-
-const maxBatchSize = 256
-
-func TestHandlerSendBatch(t *testing.T) {
-	h := NewManager(&Options{}, model.UTF8Validation, nil)
-
-	b := newBuffer(10_000)
-	h.alertmanagers = map[string]*alertmanagerSet{
-		"mock": {
-			ams: []alertmanager{
-				alertmanagerMock{
-					urlf: func() string { return "http://mock" },
-				},
-			},
-			cfg:     &config.DefaultAlertmanagerConfig,
-			buffers: map[string]*buffer{"http://mock": b},
-		},
-	}
-
-	var alerts []*Alert
-	for i := range make([]struct{}, 2*maxBatchSize+1) {
-		alerts = append(alerts, &Alert{
-			Labels: labels.FromStrings("alertname", strconv.Itoa(i)),
-		})
-	}
-	h.Send(alerts...)
-
-	expected := append([]*Alert{}, alerts...)
-
-	batch := make([]*Alert, maxBatchSize)
-
-	b.pop(&batch)
-	require.NoError(t, alertsEqual(expected[0:maxBatchSize], batch))
-
-	b.pop(&batch)
-	require.NoError(t, alertsEqual(expected[maxBatchSize:2*maxBatchSize], batch))
-
-	b.pop(&batch)
-	require.NoError(t, alertsEqual(expected[2*maxBatchSize:], batch))
-}
 
 func alertsEqual(a, b []*Alert) error {
 	if len(a) != len(b) {
@@ -130,21 +90,11 @@ func newTestHTTPServerBuilder(expected *[]*Alert, errc chan<- error, u, p string
 	}))
 }
 
-func getCounterValue(t *testing.T, metric *prometheus.CounterVec, labels ...string) float64 {
-	t.Helper()
-	m := &dto.Metric{}
-	if err := metric.WithLabelValues(labels...).Write(m); err != nil {
-		t.Fatal(err)
-	}
-	return m.Counter.GetValue()
-}
-
 func TestHandlerSendAll(t *testing.T) {
 	var (
 		errc                      = make(chan error, 1)
 		expected                  = make([]*Alert, 0)
 		status1, status2, status3 atomic.Int32
-		errors1, errors2, errors3 float64
 	)
 	status1.Store(int32(http.StatusOK))
 	status2.Store(int32(http.StatusOK))
@@ -178,7 +128,7 @@ func TestHandlerSendAll(t *testing.T) {
 	am3Cfg := config.DefaultAlertmanagerConfig
 	am3Cfg.Timeout = model.Duration(time.Second)
 
-	opts := &Options{Do: do, QueueCapacity: 10_000, MaxBatchSize: maxBatchSize}
+	opts := &Options{Do: do, QueueCapacity: 10_000, MaxBatchSize: DefaultMaxBatchSize}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	h.alertmanagers["1"] = &alertmanagerSet{
@@ -187,9 +137,11 @@ func TestHandlerSendAll(t *testing.T) {
 				urlf: func() string { return server1.URL },
 			},
 		},
-		cfg:     &am1Cfg,
-		client:  authClient,
-		buffers: map[string]*buffer{server1.URL: newBuffer(opts.QueueCapacity)},
+		cfg:    &am1Cfg,
+		client: authClient,
+		sendLoops: map[string]*sendLoop{
+			server1.URL: newSendLoop(server1.URL, authClient, &am1Cfg, opts, logger, h.metrics),
+		},
 		opts:    opts,
 		metrics: h.metrics,
 		logger:  logger,
@@ -205,9 +157,9 @@ func TestHandlerSendAll(t *testing.T) {
 			},
 		},
 		cfg: &am2Cfg,
-		buffers: map[string]*buffer{
-			server2.URL: newBuffer(opts.QueueCapacity),
-			server3.URL: newBuffer(opts.QueueCapacity),
+		sendLoops: map[string]*sendLoop{
+			server2.URL: newSendLoop(server2.URL, nil, &am2Cfg, opts, logger, h.metrics),
+			server3.URL: newSendLoop(server3.URL, nil, &am3Cfg, opts, logger, h.metrics),
 		},
 		opts:    opts,
 		metrics: h.metrics,
@@ -215,16 +167,18 @@ func TestHandlerSendAll(t *testing.T) {
 	}
 
 	h.alertmanagers["3"] = &alertmanagerSet{
-		ams:     []alertmanager{}, // empty set
-		cfg:     &am3Cfg,
-		buffers: make(map[string]*buffer),
+		ams: []alertmanager{}, // empty set
+		cfg: &am3Cfg,
+		sendLoops: map[string]*sendLoop{
+			server3.URL: newSendLoop(server3.URL, nil, &am3Cfg, opts, logger, h.metrics),
+		},
 		opts:    opts,
 		metrics: h.metrics,
 		logger:  logger,
 	}
 
 	var alerts []*Alert
-	for i := range make([]struct{}, maxBatchSize) {
+	for i := range make([]struct{}, DefaultMaxBatchSize) {
 		alerts = append(alerts, &Alert{
 			Labels: labels.FromStrings("alertname", strconv.Itoa(i)),
 		})
@@ -244,22 +198,16 @@ func TestHandlerSendAll(t *testing.T) {
 
 	// start send loops
 	for _, ams := range h.alertmanagers {
-		for _, am := range ams.ams {
-			go ams.sendLoop(am)
-		}
+		ams.startSendLoops(ams.ams)
 	}
 
-	// all ams in all sets are up
 	h.Send(alerts...)
+	// TODO(queueperam): why?
 	time.Sleep(time.Second)
 
-	// snapshot error metrics and check them
-	errors1 = getCounterValue(t, h.metrics.errors, server1.URL)
-	errors2 = getCounterValue(t, h.metrics.errors, server2.URL)
-	errors3 = getCounterValue(t, h.metrics.errors, server3.URL)
-	require.Zero(t, errors1, "server1 has unexpected send errors")
-	require.Zero(t, errors2, "server2 has unexpected send errors")
-	require.Zero(t, errors3, "server3 has unexpected send errors")
+	require.Zero(t, prom_testutil.ToFloat64(h.metrics.errors.WithLabelValues(server1.URL)))
+	require.Zero(t, prom_testutil.ToFloat64(h.metrics.errors.WithLabelValues(server2.URL)))
+	require.Zero(t, prom_testutil.ToFloat64(h.metrics.errors.WithLabelValues(server3.URL)))
 	checkNoErr()
 
 	// the only am in set 1 is down
@@ -267,15 +215,12 @@ func TestHandlerSendAll(t *testing.T) {
 	h.Send(alerts...)
 	time.Sleep(time.Second)
 
-	errors1 = getCounterValue(t, h.metrics.errors, server1.URL)
-	errors2 = getCounterValue(t, h.metrics.errors, server2.URL)
-	errors3 = getCounterValue(t, h.metrics.errors, server3.URL)
-	require.NotZero(t, errors1, "server1 has no send errors")
-	require.Zero(t, errors2, "server2 has unexpected send errors")
-	require.Zero(t, errors3, "server3 has unexpected send errors")
+	require.NotZero(t, prom_testutil.ToFloat64(h.metrics.errors.WithLabelValues(server1.URL)))
+	require.Zero(t, prom_testutil.ToFloat64(h.metrics.errors.WithLabelValues(server2.URL)))
+	require.Zero(t, prom_testutil.ToFloat64(h.metrics.errors.WithLabelValues(server3.URL)))
 	checkNoErr()
 
-	// reset it
+	// fix the am
 	status1.Store(int32(http.StatusOK))
 
 	// reset metrics
@@ -286,12 +231,9 @@ func TestHandlerSendAll(t *testing.T) {
 	h.Send(alerts...)
 	time.Sleep(time.Second)
 
-	errors1 = getCounterValue(t, h.metrics.errors, server1.URL)
-	errors2 = getCounterValue(t, h.metrics.errors, server2.URL)
-	errors3 = getCounterValue(t, h.metrics.errors, server3.URL)
-	require.Zero(t, errors1, "server1 has unexpected send errors")
-	require.NotZero(t, errors2, "server2 has no send errors")
-	require.Zero(t, errors3, "server3 has unexpected send errors")
+	require.Zero(t, prom_testutil.ToFloat64(h.metrics.errors.WithLabelValues(server1.URL)))
+	require.NotZero(t, prom_testutil.ToFloat64(h.metrics.errors.WithLabelValues(server2.URL)))
+	require.Zero(t, prom_testutil.ToFloat64(h.metrics.errors.WithLabelValues(server3.URL)))
 	checkNoErr()
 
 	// both ams in set 2 are down
@@ -299,19 +241,14 @@ func TestHandlerSendAll(t *testing.T) {
 	h.Send(alerts...)
 	time.Sleep(time.Second)
 
-	errors1 = getCounterValue(t, h.metrics.errors, server1.URL)
-	errors2 = getCounterValue(t, h.metrics.errors, server2.URL)
-	errors3 = getCounterValue(t, h.metrics.errors, server3.URL)
-	require.Zero(t, errors1, "server1 has unexpected send errors")
-	require.NotZero(t, errors2, "server2 has no send errors")
-	require.NotZero(t, errors3, "server3 has no send errors")
+	require.Zero(t, prom_testutil.ToFloat64(h.metrics.errors.WithLabelValues(server1.URL)))
+	require.NotZero(t, prom_testutil.ToFloat64(h.metrics.errors.WithLabelValues(server2.URL)))
+	require.NotZero(t, prom_testutil.ToFloat64(h.metrics.errors.WithLabelValues(server3.URL)))
 	checkNoErr()
 
-	// stop send routines by closing buffers
+	// stop send loops.
 	for _, ams := range h.alertmanagers {
-		for _, q := range ams.buffers {
-			q.close()
-		}
+		ams.cleanSendLoops(ams.ams)
 	}
 }
 
@@ -323,7 +260,6 @@ func TestHandlerSendAllRemapPerAm(t *testing.T) {
 		expected3 = make([]*Alert, 0)
 
 		status1, status2, status3 atomic.Int32
-		errors1, errors2, errors3 float64
 	)
 	status1.Store(int32(http.StatusOK))
 	status2.Store(int32(http.StatusOK))
@@ -365,7 +301,7 @@ func TestHandlerSendAllRemapPerAm(t *testing.T) {
 		},
 	}
 
-	opts := &Options{Do: do, QueueCapacity: 10_000, MaxBatchSize: maxBatchSize}
+	opts := &Options{Do: do, QueueCapacity: 10_000, MaxBatchSize: DefaultMaxBatchSize}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	h.alertmanagers = map[string]*alertmanagerSet{
@@ -376,8 +312,10 @@ func TestHandlerSendAllRemapPerAm(t *testing.T) {
 					urlf: func() string { return server1.URL },
 				},
 			},
-			cfg:     &am1Cfg,
-			buffers: map[string]*buffer{server1.URL: newBuffer(opts.QueueCapacity)},
+			cfg: &am1Cfg,
+			sendLoops: map[string]*sendLoop{
+				server1.URL: newSendLoop(server1.URL, nil, &am1Cfg, opts, logger, h.metrics),
+			},
 			opts:    opts,
 			metrics: h.metrics,
 			logger:  logger,
@@ -389,8 +327,10 @@ func TestHandlerSendAllRemapPerAm(t *testing.T) {
 					urlf: func() string { return server2.URL },
 				},
 			},
-			cfg:     &am2Cfg,
-			buffers: map[string]*buffer{server2.URL: newBuffer(opts.QueueCapacity)},
+			cfg: &am2Cfg,
+			sendLoops: map[string]*sendLoop{
+				server2.URL: newSendLoop(server2.URL, nil, &am2Cfg, opts, logger, h.metrics),
+			},
 			opts:    opts,
 			metrics: h.metrics,
 			logger:  logger,
@@ -402,25 +342,27 @@ func TestHandlerSendAllRemapPerAm(t *testing.T) {
 					urlf: func() string { return server3.URL },
 				},
 			},
-			cfg:     &am3Cfg,
-			buffers: map[string]*buffer{server3.URL: newBuffer(opts.QueueCapacity)},
+			cfg: &am3Cfg,
+			sendLoops: map[string]*sendLoop{
+				server3.URL: newSendLoop(server3.URL, nil, &am3Cfg, opts, logger, h.metrics),
+			},
 			opts:    opts,
 			metrics: h.metrics,
 			logger:  logger,
 		},
 		// Empty list of Alertmanager endpoints.
 		"4": {
-			ams:     []alertmanager{},
-			cfg:     &config.DefaultAlertmanagerConfig,
-			buffers: make(map[string]*buffer),
-			opts:    opts,
-			metrics: h.metrics,
-			logger:  logger,
+			ams:       []alertmanager{},
+			cfg:       &config.DefaultAlertmanagerConfig,
+			sendLoops: make(map[string]*sendLoop),
+			opts:      opts,
+			metrics:   h.metrics,
+			logger:    logger,
 		},
 	}
 
 	var alerts []*Alert
-	for i := range make([]struct{}, maxBatchSize/2) {
+	for i := range make([]struct{}, DefaultMaxBatchSize/2) {
 		alerts = append(alerts,
 			&Alert{
 				Labels: labels.FromStrings("alertname", strconv.Itoa(i)),
@@ -454,9 +396,7 @@ func TestHandlerSendAllRemapPerAm(t *testing.T) {
 
 	// start send loops
 	for _, ams := range h.alertmanagers {
-		for _, am := range ams.ams {
-			go ams.sendLoop(am)
-		}
+		ams.startSendLoops(ams.ams)
 	}
 
 	// all ams are up
@@ -464,12 +404,9 @@ func TestHandlerSendAllRemapPerAm(t *testing.T) {
 	time.Sleep(time.Second)
 
 	// snapshot error metrics and check them
-	errors1 = getCounterValue(t, h.metrics.errors, server1.URL)
-	errors2 = getCounterValue(t, h.metrics.errors, server2.URL)
-	errors3 = getCounterValue(t, h.metrics.errors, server3.URL)
-	require.Zero(t, errors1, "server1 has unexpected send errors")
-	require.Zero(t, errors2, "server2 has unexpected send errors")
-	require.Zero(t, errors3, "server3 has unexpected send errors")
+	require.Zero(t, prom_testutil.ToFloat64(h.metrics.errors.WithLabelValues(server1.URL)))
+	require.Zero(t, prom_testutil.ToFloat64(h.metrics.errors.WithLabelValues(server2.URL)))
+	require.Zero(t, prom_testutil.ToFloat64(h.metrics.errors.WithLabelValues(server3.URL)))
 	checkNoErr()
 
 	// the only am in set 1 goes down
@@ -477,12 +414,9 @@ func TestHandlerSendAllRemapPerAm(t *testing.T) {
 	h.Send(alerts...)
 	time.Sleep(time.Second)
 
-	errors1 = getCounterValue(t, h.metrics.errors, server1.URL)
-	errors2 = getCounterValue(t, h.metrics.errors, server2.URL)
-	errors3 = getCounterValue(t, h.metrics.errors, server3.URL)
-	require.NotZero(t, errors1, "server1 has no send errors")
-	require.Zero(t, errors2, "server2 has unexpected send errors")
-	require.Zero(t, errors3, "server3 has unexpected send errors")
+	require.NotZero(t, prom_testutil.ToFloat64(h.metrics.errors.WithLabelValues(server1.URL)))
+	require.Zero(t, prom_testutil.ToFloat64(h.metrics.errors.WithLabelValues(server2.URL)))
+	require.Zero(t, prom_testutil.ToFloat64(h.metrics.errors.WithLabelValues(server3.URL)))
 	checkNoErr()
 
 	// reset set 1
@@ -497,19 +431,14 @@ func TestHandlerSendAllRemapPerAm(t *testing.T) {
 	h.Send(alerts...)
 	time.Sleep(3 * time.Second)
 
-	errors1 = getCounterValue(t, h.metrics.errors, server1.URL)
-	errors2 = getCounterValue(t, h.metrics.errors, server2.URL)
-	errors3 = getCounterValue(t, h.metrics.errors, server3.URL)
-	require.Zero(t, errors1, "server1 has unexpected send errors")
-	require.Zero(t, errors2, "server2 has unexpected send errors")
-	require.Zero(t, errors3, "server3 has unexpected send errors")
+	require.Zero(t, prom_testutil.ToFloat64(h.metrics.errors.WithLabelValues(server1.URL)))
+	require.Zero(t, prom_testutil.ToFloat64(h.metrics.errors.WithLabelValues(server2.URL)))
+	require.Zero(t, prom_testutil.ToFloat64(h.metrics.errors.WithLabelValues(server3.URL)))
 	checkNoErr()
 
-	// stop send routines by closing buffers
+	// stop send loops.
 	for _, ams := range h.alertmanagers {
-		for _, q := range ams.buffers {
-			q.close()
-		}
+		ams.cleanSendLoops(ams.ams)
 	}
 
 	// Verify that individual locks are released.
@@ -521,9 +450,10 @@ func TestHandlerSendAllRemapPerAm(t *testing.T) {
 }
 
 func TestExternalLabels(t *testing.T) {
+	reg := prometheus.NewRegistry()
 	h := NewManager(&Options{
-		QueueCapacity:  3 * maxBatchSize,
-		MaxBatchSize:   maxBatchSize,
+		QueueCapacity:  3 * DefaultMaxBatchSize,
+		MaxBatchSize:   DefaultMaxBatchSize,
 		ExternalLabels: labels.FromStrings("a", "b"),
 		RelabelConfigs: []*relabel.Config{
 			{
@@ -535,14 +465,15 @@ func TestExternalLabels(t *testing.T) {
 				NameValidationScheme: model.UTF8Validation,
 			},
 		},
+		Registerer: reg,
 	}, model.UTF8Validation, nil)
 
-	queue := newBuffer(h.opts.QueueCapacity)
+	cfg := config.DefaultAlertmanagerConfig
 	h.alertmanagers = map[string]*alertmanagerSet{
 		"test": {
-			buffers: map[string]*buffer{"test": queue},
-			cfg: &config.AlertmanagerConfig{
-				RelabelConfigs: h.opts.RelabelConfigs,
+			cfg: &cfg,
+			sendLoops: map[string]*sendLoop{
+				"test": newSendLoop("test", nil, &cfg, h.opts, slog.New(slog.NewTextHandler(io.Discard, nil)), h.metrics),
 			},
 		},
 	}
@@ -558,21 +489,19 @@ func TestExternalLabels(t *testing.T) {
 		Labels: labels.FromStrings("alertname", "externalrelabelthis"),
 	})
 
-	alerts := make([]*Alert, maxBatchSize)
-	queue.pop(&alerts)
-
 	expected := []*Alert{
 		{Labels: labels.FromStrings("alertname", "test", "a", "b")},
 		{Labels: labels.FromStrings("alertname", "externalrelabelthis", "a", "c")},
 	}
 
-	require.NoError(t, alertsEqual(expected, alerts))
+	require.NoError(t, alertsEqual(expected, h.alertmanagers["test"].sendLoops["test"].queue))
 }
 
 func TestHandlerRelabel(t *testing.T) {
+	reg := prometheus.NewRegistry()
 	h := NewManager(&Options{
-		QueueCapacity: 3 * maxBatchSize,
-		MaxBatchSize:  maxBatchSize,
+		QueueCapacity: 3 * DefaultMaxBatchSize,
+		MaxBatchSize:  DefaultMaxBatchSize,
 		RelabelConfigs: []*relabel.Config{
 			{
 				SourceLabels:         model.LabelNames{"alertname"},
@@ -589,14 +518,15 @@ func TestHandlerRelabel(t *testing.T) {
 				NameValidationScheme: model.UTF8Validation,
 			},
 		},
+		Registerer: reg,
 	}, model.UTF8Validation, nil)
 
-	queue := newBuffer(h.opts.QueueCapacity)
+	cfg := config.DefaultAlertmanagerConfig
 	h.alertmanagers = map[string]*alertmanagerSet{
 		"test": {
-			buffers: map[string]*buffer{"test": queue},
-			cfg: &config.AlertmanagerConfig{
-				RelabelConfigs: h.opts.RelabelConfigs,
+			cfg: &cfg,
+			sendLoops: map[string]*sendLoop{
+				"test": newSendLoop("test", nil, &cfg, h.opts, slog.New(slog.NewTextHandler(io.Discard, nil)), h.metrics),
 			},
 		},
 	}
@@ -611,14 +541,11 @@ func TestHandlerRelabel(t *testing.T) {
 		Labels: labels.FromStrings("alertname", "rename"),
 	})
 
-	alerts := make([]*Alert, maxBatchSize)
-	queue.pop(&alerts)
-
 	expected := []*Alert{
 		{Labels: labels.FromStrings("alertname", "renamed")},
 	}
 
-	require.NoError(t, alertsEqual(expected, alerts))
+	require.NoError(t, alertsEqual(expected, h.alertmanagers["test"].sendLoops["test"].queue))
 }
 
 func TestHandlerQueuing(t *testing.T) {
@@ -663,10 +590,12 @@ func TestHandlerQueuing(t *testing.T) {
 		server.Close()
 	}()
 
+	reg := prometheus.NewRegistry()
 	h := NewManager(
 		&Options{
-			QueueCapacity: 3 * maxBatchSize,
-			MaxBatchSize:  maxBatchSize,
+			QueueCapacity: 3 * DefaultMaxBatchSize,
+			MaxBatchSize:  DefaultMaxBatchSize,
+			Registerer:    reg,
 		},
 		model.UTF8Validation,
 		nil,
@@ -683,24 +612,22 @@ func TestHandlerQueuing(t *testing.T) {
 				urlf: func() string { return server.URL },
 			},
 		},
-		cfg:     &am1Cfg,
-		buffers: map[string]*buffer{server.URL: newBuffer(h.opts.QueueCapacity)},
-		metrics: h.metrics,
-		opts:    &Options{Do: do, MaxBatchSize: maxBatchSize},
-		logger:  slog.New(slog.NewTextHandler(io.Discard, nil)),
-	}
-
-	for _, ams := range h.alertmanagers {
-		for _, am := range ams.ams {
-			go ams.sendLoop(am)
-		}
+		cfg: &am1Cfg,
+		sendLoops: map[string]*sendLoop{
+			server.URL: newSendLoop(server.URL, nil, &am1Cfg, h.opts, slog.New(slog.NewTextHandler(io.Discard, nil)), h.metrics),
+		},
 	}
 
 	go h.Run(nil)
 	defer h.Stop()
 
+	// start send loops
+	for _, ams := range h.alertmanagers {
+		ams.startSendLoops(ams.ams)
+	}
+
 	var alerts []*Alert
-	for i := range make([]struct{}, 20*maxBatchSize) {
+	for i := range make([]struct{}, 20*DefaultMaxBatchSize) {
 		alerts = append(alerts, &Alert{
 			Labels: labels.FromStrings("alertname", strconv.Itoa(i)),
 		})
@@ -723,27 +650,27 @@ func TestHandlerQueuing(t *testing.T) {
 
 	// If the batch is larger than the queue capacity, it should be truncated
 	// from the front.
-	h.Send(alerts[:4*maxBatchSize]...)
+	h.Send(alerts[:4*DefaultMaxBatchSize]...)
 	for i := 1; i < 4; i++ {
-		assertAlerts(alerts[i*maxBatchSize : (i+1)*maxBatchSize])
+		assertAlerts(alerts[i*DefaultMaxBatchSize : (i+1)*DefaultMaxBatchSize])
 	}
 
 	// Send one batch, wait for it to arrive and block the server so the queue fills up.
-	h.Send(alerts[:maxBatchSize]...)
+	h.Send(alerts[:DefaultMaxBatchSize]...)
 	<-called
 
 	// Send several batches while the server is still blocked so the queue
-	// fills up to its maximum capacity (3*maxBatchSize). Then check that the
+	// fills up to its maximum capacity (3*DefaultMaxBatchSize). Then check that the
 	// queue is truncated in the front.
-	h.Send(alerts[1*maxBatchSize : 2*maxBatchSize]...) // this batch should be dropped.
-	h.Send(alerts[2*maxBatchSize : 3*maxBatchSize]...)
-	h.Send(alerts[3*maxBatchSize : 4*maxBatchSize]...)
+	h.Send(alerts[1*DefaultMaxBatchSize : 2*DefaultMaxBatchSize]...) // this batch should be dropped.
+	h.Send(alerts[2*DefaultMaxBatchSize : 3*DefaultMaxBatchSize]...)
+	h.Send(alerts[3*DefaultMaxBatchSize : 4*DefaultMaxBatchSize]...)
 
 	// Send the batch that drops the first one.
-	h.Send(alerts[4*maxBatchSize : 5*maxBatchSize]...)
+	h.Send(alerts[4*DefaultMaxBatchSize : 5*DefaultMaxBatchSize]...)
 
 	// Unblock the server.
-	expectedc <- alerts[:maxBatchSize]
+	expectedc <- alerts[:DefaultMaxBatchSize]
 	select {
 	case err := <-errc:
 		require.NoError(t, err)
@@ -753,7 +680,12 @@ func TestHandlerQueuing(t *testing.T) {
 
 	// Verify that we receive the last 3 batches.
 	for i := 2; i < 5; i++ {
-		assertAlerts(alerts[i*maxBatchSize : (i+1)*maxBatchSize])
+		assertAlerts(alerts[i*DefaultMaxBatchSize : (i+1)*DefaultMaxBatchSize])
+	}
+
+	// stop send loops.
+	for _, ams := range h.alertmanagers {
+		ams.cleanSendLoops(ams.ams)
 	}
 }
 
@@ -886,11 +818,11 @@ func makeInputTargetGroup() *targetgroup.Group {
 // TestHangingNotifier ensures that the notifier takes into account SD changes even when there are
 // queued alerts. This test reproduces the issue described in https://github.com/prometheus/prometheus/issues/13676.
 // and https://github.com/prometheus/prometheus/issues/8768.
-// TODO: Drop this test as we have independent queues per alertmanager now.
+// TODO(queueperam): Drop this test as we have independent queues per alertmanager now.
 func TestHangingNotifier(t *testing.T) {
 	const (
 		batches     = 100
-		alertsCount = maxBatchSize * batches
+		alertsCount = DefaultMaxBatchSize * batches
 	)
 
 	var (
@@ -946,6 +878,7 @@ func TestHangingNotifier(t *testing.T) {
 	notifier := NewManager(
 		&Options{
 			QueueCapacity: alertsCount,
+			Registerer:    reg,
 		},
 		model.UTF8Validation,
 		nil,
@@ -964,18 +897,16 @@ func TestHangingNotifier(t *testing.T) {
 		},
 		cfg:     &amCfg,
 		metrics: notifier.metrics,
-		buffers: map[string]*buffer{
-			faultyURL.String():     newBuffer(notifier.opts.QueueCapacity),
-			functionalURL.String(): newBuffer(notifier.opts.QueueCapacity),
+		sendLoops: map[string]*sendLoop{
+			faultyURL.String():     newSendLoop(faultyURL.String(), nil, &amCfg, notifier.opts, slog.New(slog.NewTextHandler(io.Discard, nil)), notifier.metrics),
+			functionalURL.String(): newSendLoop(functionalURL.String(), nil, &amCfg, notifier.opts, slog.New(slog.NewTextHandler(io.Discard, nil)), notifier.metrics),
 		},
-		opts:   &Options{Do: do, MaxBatchSize: maxBatchSize},
+		opts:   &Options{Do: do, MaxBatchSize: DefaultMaxBatchSize},
 		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
 
 	for _, ams := range notifier.alertmanagers {
-		for _, am := range ams.ams {
-			go ams.sendLoop(am)
-		}
+		ams.startSendLoops(ams.ams)
 	}
 
 	go notifier.Run(sdManager.SyncCh())
@@ -1038,8 +969,8 @@ loop2:
 			if len(notifier.Alertmanagers()) == 1 {
 				// Prevent from TOCTOU.
 				for _, ams := range notifier.alertmanagers {
-					for _, q := range ams.buffers {
-						require.Zero(t, q.len())
+					for _, s := range ams.sendLoops {
+						require.Empty(t, s.queue)
 					}
 				}
 				break loop2
@@ -1076,10 +1007,12 @@ func TestStop_DrainingDisabled(t *testing.T) {
 		server.Close()
 	}()
 
+	reg := prometheus.NewRegistry()
 	m := NewManager(
 		&Options{
 			QueueCapacity:   10,
 			DrainOnShutdown: false,
+			Registerer:      reg,
 		},
 		model.UTF8Validation,
 		nil,
@@ -1096,17 +1029,16 @@ func TestStop_DrainingDisabled(t *testing.T) {
 				urlf: func() string { return server.URL },
 			},
 		},
-		cfg:     &am1Cfg,
-		buffers: map[string]*buffer{server.URL: newBuffer(m.opts.QueueCapacity)},
-		opts:    &Options{Do: do, MaxBatchSize: maxBatchSize},
-		metrics: newAlertMetrics(prometheus.DefaultRegisterer, nil),
-		logger:  slog.New(slog.NewTextHandler(io.Discard, nil)),
+		cfg: &am1Cfg,
+		sendLoops: map[string]*sendLoop{
+			server.URL: newSendLoop(server.URL, nil, &am1Cfg, m.opts, slog.New(slog.NewTextHandler(io.Discard, nil)), m.metrics),
+		},
+		opts:   &Options{Do: do, MaxBatchSize: DefaultMaxBatchSize},
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
 
 	for _, ams := range m.alertmanagers {
-		for _, am := range ams.ams {
-			go ams.sendLoop(am)
-		}
+		ams.startSendLoops(ams.ams)
 	}
 
 	notificationManagerStopped := make(chan struct{})
@@ -1174,10 +1106,12 @@ func TestStop_DrainingEnabled(t *testing.T) {
 		server.Close()
 	}()
 
+	reg := prometheus.NewRegistry()
 	m := NewManager(
 		&Options{
 			QueueCapacity:   10,
 			DrainOnShutdown: true,
+			Registerer:      reg,
 		},
 		model.UTF8Validation,
 		nil,
@@ -1194,17 +1128,17 @@ func TestStop_DrainingEnabled(t *testing.T) {
 				urlf: func() string { return server.URL },
 			},
 		},
-		cfg:     &am1Cfg,
-		buffers: map[string]*buffer{server.URL: newBuffer(m.opts.QueueCapacity)},
-		opts:    &Options{Do: do, MaxBatchSize: maxBatchSize},
+		cfg: &am1Cfg,
+		sendLoops: map[string]*sendLoop{
+			server.URL: newSendLoop(server.URL, nil, &am1Cfg, m.opts, slog.New(slog.NewTextHandler(io.Discard, nil)), m.metrics),
+		},
+		opts:    &Options{Do: do, MaxBatchSize: DefaultMaxBatchSize},
 		metrics: m.metrics,
 		logger:  slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
 
 	for _, ams := range m.alertmanagers {
-		for _, am := range ams.ams {
-			go ams.sendLoop(am)
-		}
+		ams.startSendLoops(ams.ams)
 	}
 
 	notificationManagerStopped := make(chan struct{})
@@ -1358,7 +1292,13 @@ func TestNotifierQueueIndependentOfFailedAlertmanager(t *testing.T) {
 	doneAlertReceive := make(chan struct{})
 	immediateAM := newImmediateAlertManager(doneAlertReceive)
 
-	h := NewManager(&Options{}, nil)
+	reg := prometheus.NewRegistry()
+	h := NewManager(&Options{
+		Do:            do,
+		QueueCapacity: 10,
+		MaxBatchSize:  DefaultMaxBatchSize,
+		Registerer:    reg,
+	}, model.UTF8Validation, nil)
 
 	h.alertmanagers = make(map[string]*alertmanagerSet)
 
@@ -1371,9 +1311,11 @@ func TestNotifierQueueIndependentOfFailedAlertmanager(t *testing.T) {
 				urlf: func() string { return blackHoleAM.URL },
 			},
 		},
-		cfg:     &amCfg,
-		opts:    &Options{Do: do, MaxBatchSize: maxBatchSize},
-		buffers: map[string]*buffer{blackHoleAM.URL: newBuffer(10)},
+		cfg:  &amCfg,
+		opts: h.opts,
+		sendLoops: map[string]*sendLoop{
+			blackHoleAM.URL: newSendLoop(blackHoleAM.URL, nil, &amCfg, h.opts, slog.New(slog.NewTextHandler(io.Discard, nil)), h.metrics),
+		},
 		metrics: h.metrics,
 	}
 
@@ -1383,18 +1325,18 @@ func TestNotifierQueueIndependentOfFailedAlertmanager(t *testing.T) {
 				urlf: func() string { return immediateAM.URL },
 			},
 		},
-		cfg:     &amCfg,
-		opts:    &Options{Do: do, MaxBatchSize: maxBatchSize},
-		buffers: map[string]*buffer{immediateAM.URL: newBuffer(10)},
+		cfg:  &amCfg,
+		opts: h.opts,
+		sendLoops: map[string]*sendLoop{
+			immediateAM.URL: newSendLoop(immediateAM.URL, nil, &amCfg, h.opts, slog.New(slog.NewTextHandler(io.Discard, nil)), h.metrics),
+		},
 		metrics: h.metrics,
 	}
 
 	doneSendAll := make(chan struct{})
 	go func() {
-		for _, s := range h.alertmanagers {
-			for _, am := range s.ams {
-				go s.sendLoop(am)
-			}
+		for _, ams := range h.alertmanagers {
+			ams.startSendLoops(ams.ams)
 		}
 
 		h.Send(&Alert{

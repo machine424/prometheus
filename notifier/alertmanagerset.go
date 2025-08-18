@@ -14,17 +14,12 @@
 package notifier
 
 import (
-	"bytes"
-	"context"
 	"crypto/md5"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"sync"
-	"time"
 
 	config_util "github.com/prometheus/common/config"
 	"github.com/prometheus/sigv4"
@@ -47,8 +42,9 @@ type alertmanagerSet struct {
 	mtx        sync.RWMutex
 	ams        []alertmanager
 	droppedAms []alertmanager
-	buffers    map[string]*buffer
-	logger     *slog.Logger
+	sendLoops  map[string]*sendLoop
+
+	logger *slog.Logger
 }
 
 func newAlertmanagerSet(cfg *config.AlertmanagerConfig, opts *Options, logger *slog.Logger, metrics *alertMetrics) (*alertmanagerSet, error) {
@@ -68,12 +64,12 @@ func newAlertmanagerSet(cfg *config.AlertmanagerConfig, opts *Options, logger *s
 	client.Transport = t
 
 	s := &alertmanagerSet{
-		client:  client,
-		cfg:     cfg,
-		opts:    opts,
-		buffers: make(map[string]*buffer),
-		logger:  logger,
-		metrics: metrics,
+		client:    client,
+		cfg:       cfg,
+		opts:      opts,
+		sendLoops: make(map[string]*sendLoop),
+		logger:    logger,
+		metrics:   metrics,
 	}
 	return s, nil
 }
@@ -113,12 +109,15 @@ func (s *alertmanagerSet) sync(tgs []*targetgroup.Group) {
 		s.metrics.dropped.WithLabelValues(us)
 		s.metrics.errors.WithLabelValues(us)
 		s.metrics.sent.WithLabelValues(us)
+		// TODO(queueperam): latency??
+		s.metrics.queueLength.WithLabelValues(us)
+		// TODO(queueperam): if it's the same for all ams, why have an am label???
 		s.metrics.queueCapacity.WithLabelValues(us).Set(float64(s.opts.QueueCapacity))
 
 		seen[us] = struct{}{}
 		s.ams = append(s.ams, am)
 	}
-	s.startSendLoops(allAms)
+	s.addSendLoops(s.ams)
 
 	// Now remove counters for any removed Alertmanagers.
 	for _, am := range previousAms {
@@ -126,11 +125,13 @@ func (s *alertmanagerSet) sync(tgs []*targetgroup.Group) {
 		if _, ok := seen[us]; ok {
 			continue
 		}
+		// TODO(queueperam): how to test this
 		s.metrics.dropped.DeleteLabelValues(us)
 		s.metrics.errors.DeleteLabelValues(us)
+		s.metrics.sent.DeleteLabelValues(us)
 		s.metrics.latency.DeleteLabelValues(us)
 		s.metrics.queueLength.DeleteLabelValues(us)
-		s.metrics.sent.DeleteLabelValues(us)
+		s.metrics.queueCapacity.DeleteLabelValues(us)
 		seen[us] = struct{}{}
 	}
 	s.cleanSendLoops(previousAms)
@@ -145,148 +146,56 @@ func (s *alertmanagerSet) configHash() (string, error) {
 	return hex.EncodeToString(hash[:]), nil
 }
 
-func (s *alertmanagerSet) send(alerts ...*Alert) map[string]int {
-	dropped := make(map[string]int)
+func (s *alertmanagerSet) send(alerts ...*Alert) {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
 
 	if len(s.cfg.AlertRelabelConfigs) > 0 {
 		alerts = relabelAlerts(s.cfg.AlertRelabelConfigs, labels.Labels{}, alerts)
 		if len(alerts) == 0 {
-			return dropped
-		}
-	}
-
-	for am, q := range s.buffers {
-		d := q.push(alerts...)
-		dropped[am] += d
-	}
-
-	return dropped
-}
-
-// startSendLoops create buffers for newly discovered alertmanager and
-// starts a send loop for each.
-// This function expects the caller to acquire needed locks.
-func (s *alertmanagerSet) startSendLoops(all []alertmanager) {
-	for _, am := range all {
-		us := am.url().String()
-		// create new buffers and start send loops for new alertmanagers in the set.
-		if _, ok := s.buffers[us]; !ok {
-			s.buffers[us] = newBuffer(s.opts.QueueCapacity)
-			go s.sendLoop(am)
-		}
-	}
-}
-
-// stopSendLoops stops the send loops for each removed alertmanager by
-// closing and removing their respective buffers.
-// This function expects the caller to acquire needed locks.
-func (s *alertmanagerSet) cleanSendLoops(removed []alertmanager) {
-	for _, am := range removed {
-		us := am.url().String()
-		s.buffers[us].close()
-		delete(s.buffers, us)
-	}
-}
-
-func (s *alertmanagerSet) sendLoop(am alertmanager) {
-	url := am.url().String()
-
-	// allocate an alerts buffer for alerts with length and capacity equal to max batch size.
-	alerts := make([]*Alert, s.opts.MaxBatchSize)
-	for {
-		b := s.getBuffer(url)
-		if b == nil {
 			return
 		}
+	}
 
-		_, ok := <-b.hasWork
-		if !ok {
-			return
-		}
+	for _, sendLoop := range s.sendLoops {
+		sendLoop.add(alerts...)
+	}
+}
 
-		b.pop(&alerts)
+// addSendLoops creates and starts a send loop for newly discovered alertmanager.
+// This function expects the caller to acquire needed locks.
+func (s *alertmanagerSet) addSendLoops(ams []alertmanager) {
+	for _, am := range ams {
+		us := am.url().String()
+		sendLoop := newSendLoop(us, s.client, s.cfg, s.opts, s.logger.With("alertmanager", us), s.metrics)
+		go sendLoop.loop()
+		s.sendLoops[us] = sendLoop
+	}
+}
 
-		if !s.postNotifications(am, alerts) {
-			s.metrics.dropped.WithLabelValues(url).Add(float64(len(alerts)))
+// cleanSendLoops stops and cleans the send loops for each removed alertmanager.
+// This function expects the caller to acquire needed locks.
+func (s *alertmanagerSet) cleanSendLoops(ams []alertmanager) {
+	for _, am := range ams {
+		us := am.url().String()
+		if sendLoop, ok := s.sendLoops[us]; ok {
+			sendLoop.stop()
+			delete(s.sendLoops, us)
 		}
 	}
 }
 
-func (s *alertmanagerSet) postNotifications(am alertmanager, alerts []*Alert) bool {
-	if len(alerts) == 0 {
-		return true
-	}
+// startSendLoops starts a send loop for newly discovered alertmanager.
+// This function expects the caller to acquire needed locks.
+// This is mainly needed for testing where the loops are added as part of the test setup.
+func (s *alertmanagerSet) startSendLoops(ams []alertmanager) {
+	for _, am := range ams {
+		us := am.url().String()
 
-	begin := time.Now()
-
-	var payload []byte
-	var err error
-	switch s.cfg.APIVersion {
-	case config.AlertmanagerAPIVersionV2:
-		{
-			openAPIAlerts := alertsToOpenAPIAlerts(alerts)
-
-			payload, err = json.Marshal(openAPIAlerts)
-			if err != nil {
-				s.logger.Error("Encoding alerts for Alertmanager API v2 failed", "err", err)
-				return false
-			}
+		if l, ok := s.sendLoops[us]; ok {
+			go l.loop()
+			continue
 		}
-
-	default:
-		{
-			s.logger.Error(
-				fmt.Sprintf("Invalid Alertmanager API version '%v', expected one of '%v'", s.cfg.APIVersion, config.SupportedAlertmanagerAPIVersions),
-				"err", err,
-			)
-			return false
-		}
+		panic(fmt.Sprintf("send loop not found for %s", us))
 	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(s.cfg.Timeout))
-	defer cancel()
-
-	url := am.url().String()
-	if err := s.sendOne(ctx, s.client, url, payload); err != nil {
-		s.logger.Error("Error sending alerts", "alertmanager", url, "count", len(alerts), "err", err)
-		s.metrics.errors.WithLabelValues(url).Add(float64(len(alerts)))
-		return false
-	}
-	s.metrics.latency.WithLabelValues(url).Observe(time.Since(begin).Seconds())
-	s.metrics.sent.WithLabelValues(url).Add(float64(len(alerts)))
-
-	return true
-}
-
-func (s *alertmanagerSet) sendOne(ctx context.Context, c *http.Client, url string, b []byte) error {
-	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(b))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("User-Agent", userAgent)
-	req.Header.Set("Content-Type", contentTypeJSON)
-	resp, err := s.opts.Do(ctx, c, req)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		io.Copy(io.Discard, resp.Body)
-		resp.Body.Close()
-	}()
-
-	// Any HTTP status 2xx is OK.
-	if resp.StatusCode/100 != 2 {
-		return fmt.Errorf("bad response status %s", resp.Status)
-	}
-
-	return nil
-}
-
-func (s *alertmanagerSet) getBuffer(url string) *buffer {
-	s.mtx.RLock()
-	defer s.mtx.RUnlock()
-	if q, ok := s.buffers[url]; ok {
-		return q
-	}
-	return nil
 }
