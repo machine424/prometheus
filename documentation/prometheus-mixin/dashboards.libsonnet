@@ -534,9 +534,9 @@ local row = panel.row;
             '$datasource',
             |||
               (
-                prometheus_remote_storage_highest_timestamp_in_seconds{%(clusterLabel)s=~"$cluster", instance=~"$instance"}
+                prometheus_remote_storage_queue_highest_timestamp_in_seconds{%(clusterLabel)s=~"$cluster", instance=~"$instance"}
               -
-                ignoring(remote_name, url) group_right(instance) (prometheus_remote_storage_queue_highest_sent_timestamp_seconds{%(clusterLabel)s=~"$cluster", instance=~"$instance", url=~"$url"} != 0)
+                prometheus_remote_storage_queue_highest_sent_timestamp_seconds{%(clusterLabel)s=~"$cluster", instance=~"$instance", url=~"$url"}
               )
             ||| % $._config
           )
