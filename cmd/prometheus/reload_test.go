@@ -24,6 +24,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -209,6 +210,7 @@ func prometheusCommandWithLogging(t *testing.T, configFilePath string, port int,
 		"-test.main",
 		"--config.file=" + configFilePath,
 		"--web.listen-address=0.0.0.0:" + strconv.Itoa(port),
+		"--log.level=debug",
 	}
 	args = append(args, extraArgs...)
 	prom := exec.Command(promPath, args...)
@@ -225,7 +227,7 @@ func prometheusCommandWithLogging(t *testing.T, configFilePath string, port int,
 	}()
 
 	t.Cleanup(func() {
-		prom.Process.Kill()
+		prom.Process.Signal(syscall.SIGTERM)
 		prom.Wait()
 		stdoutWriter.Close()
 		stderrWriter.Close()
