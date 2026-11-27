@@ -1,0 +1,124 @@
+name: Sync release-4.0 with main
+
+on:
+  schedule:
+    - cron: '13 7 * * 2'
+  workflow_dispatch: {}
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+permissions: {}
+
+env:
+  SYNC_BRANCH: sync/main-to-release-4.0
+  UPSTREAM: prometheus/prometheus
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Decide whether there is work
+        id: decide
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_4_0_SYNC_PAT }}
+        run: |
+          open_pr="$(gh pr list --repo "$UPSTREAM" --head "${{ github.repository_owner }}:$SYNC_BRANCH" \
+            --base release-4.0 --state open --json number --jq '.[0].number')"
+          if [ -n "$open_pr" ]; then
+            echo "::notice::Pull request #${open_pr} is still open; merge it and the next run carries on."
+            exit 0
+          fi
+          if [ "$(gh api "repos/$UPSTREAM/compare/release-4.0...main" --jq .ahead_by)" -eq 0 ]; then
+            echo "::notice::release-4.0 is already up to date with main."
+            exit 0
+          fi
+          echo "run=true" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout upstream release-4.0
+        if: steps.decide.outputs.run == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: prometheus/prometheus
+          ref: release-4.0
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Merge main
+        if: steps.decide.outputs.run == 'true'
+        id: merge
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_4_0_SYNC_PAT }}
+        run: |
+          git config user.name "Ayoub Mrini"
+          git config user.email "ayoubmrini424@gmail.com"
+          gh auth setup-git
+
+          git fetch origin main
+
+          if ! git merge --no-ff --signoff origin/main \
+               -m "chore: merge main into release-4.0"; then
+            {
+              echo "state=conflict"
+              echo "conflicts<<CONFLICT_EOF"
+              git diff --name-only --diff-filter=U | sort
+              echo "CONFLICT_EOF"
+            } >> "$GITHUB_OUTPUT"
+            git merge --abort
+            exit 0
+          fi
+
+          echo "state=merged" >> "$GITHUB_OUTPUT"
+
+      - name: Push branch and open pull request
+        if: steps.merge.outputs.state == 'merged'
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_4_0_SYNC_PAT }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          git remote add fork "https://github.com/${{ github.repository }}.git"
+          git push --force fork "HEAD:refs/heads/$SYNC_BRANCH"
+
+          gh pr create --repo "$UPSTREAM" \
+            --head "${{ github.repository_owner }}:$SYNC_BRANCH" \
+            --base release-4.0 \
+            --title 'chore: sync release-4.0 with main' \
+            --body "Automated sync of main into release-4.0 while 4.0 is still under development.
+
+          Opened by [workflow run]($RUN_URL).
+
+          Use Create a merge commitâ€”squashing or rebasing erases main's
+          merge history and causes future syncs to repeat these commits and conflicts.
+
+          While this is open the sync is paused, so merging or closing it is
+          what lets the next run continue.
+
+          \`\`\`release-notes
+          NONE
+          \`\`\`"
+
+      - name: Report conflict
+        if: always() && steps.merge.outputs.state == 'conflict'
+        env:
+          CONFLICTS: ${{ steps.merge.outputs.conflicts }}
+        run: |
+          {
+            echo '## Sync failed: merge conflict'
+            echo
+            echo 'The following files have merge conflicts:'
+            echo '```'
+            echo "$CONFLICTS"
+            echo '```'
+            echo 'release-4.0 is untouched. Resolve on a branch and open a pull'
+            echo 'request; the next scheduled run continues from there.'
+            echo '```bash'
+            echo 'git fetch origin main release-4.0'
+            echo 'git checkout -b fix/sync-conflict origin/release-4.0'
+            echo 'git merge origin/main  # resolve, then open a PR into release-4.0'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 1
